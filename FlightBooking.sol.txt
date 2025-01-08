@@ -1,0 +1,219 @@
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.7.0 <0.9.0;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+contract FlightBooking is Ownable, ReentrancyGuard {
+    using Counters for Counters.Counter;
+    Counters.Counter private _totalFlights;
+
+    struct FlightStruct {
+        uint id;
+        string flightNumber;
+        string departure;
+        string arrival;
+        string date;
+        uint totalSeats;
+        uint pricePerSeat;
+        uint availableSeats;
+        address airline;
+        bool isActive;
+        bool isDeleted;
+        uint timestamp;
+    }
+
+    struct BookingStruct {
+        uint id;
+        address passenger;
+        uint seatCount;
+        uint totalPrice;
+        bool checkedIn;
+        bool cancelled;
+        uint bookingDate;
+    }
+
+    struct ReviewStruct {
+        uint id;
+        uint flightId;
+        string reviewText;
+        uint timestamp;
+        address owner;
+    }
+
+    event SecurityFeeUpdated(uint newFee);
+
+    uint public securityFee;
+    uint public taxPercent;
+
+    mapping(uint => FlightStruct) flights;
+    mapping(uint => BookingStruct[]) bookingsOf;
+    mapping(uint => ReviewStruct[]) reviewsOf;
+    mapping(uint => bool) flightExist;
+    mapping(address => mapping(uint => bool)) hasBooked;
+
+    constructor(uint _taxPercent, uint _securityFee) {
+        taxPercent = _taxPercent;
+        securityFee = _securityFee;
+    }
+
+    // Create a Flight
+    function createFlight(
+        string memory flightNumber,
+        string memory departure,
+        string memory arrival,
+        string memory date,
+        uint totalSeats,
+        uint pricePerSeat
+    ) public {
+        require(bytes(flightNumber).length > 0, "Flight Number cannot be empty");
+        require(bytes(departure).length > 0, "Departure cannot be empty");
+        require(bytes(arrival).length > 0, "Arrival cannot be empty");
+        require(bytes(date).length > 0, "Date cannot be empty");
+        require(totalSeats > 0, "Seats cannot be zero");
+        require(pricePerSeat > 0 ether, "Price cannot be zero");
+
+        _totalFlights.increment();
+        FlightStruct memory flight;
+        flight.id = _totalFlights.current();
+        flight.flightNumber = flightNumber;
+        flight.departure = departure;
+        flight.arrival = arrival;
+        flight.date = date;
+        flight.totalSeats = totalSeats;
+        flight.availableSeats = totalSeats;
+        flight.pricePerSeat = pricePerSeat;
+        flight.airline = msg.sender;
+        flight.isActive = true;
+        flight.timestamp = block.timestamp;
+
+        flightExist[flight.id] = true;
+        flights[_totalFlights.current()] = flight;
+    }
+
+    // Update Flight Details
+    function updateFlight(
+        uint id,
+        string memory departure,
+        string memory arrival,
+        string memory date,
+        uint totalSeats,
+        uint pricePerSeat
+    ) public {
+        require(flightExist[id], "Flight not found");
+        require(msg.sender == flights[id].airline, "Unauthorized personnel");
+        require(totalSeats > 0, "Seats cannot be zero");
+        require(pricePerSeat > 0 ether, "Price cannot be zero");
+
+        FlightStruct storage flight = flights[id];
+        flight.departure = departure;
+        flight.arrival = arrival;
+        flight.date = date;
+        flight.totalSeats = totalSeats;
+        flight.availableSeats = totalSeats;
+        flight.pricePerSeat = pricePerSeat;
+    }
+
+    // Delete Flight
+    function deleteFlight(uint id) public {
+        require(flightExist[id], "Flight not found");
+        require(msg.sender == flights[id].airline, "Unauthorized personnel");
+
+        flightExist[id] = false;
+        flights[id].isDeleted = true;
+    }
+
+    // Get All Active Flights
+    function getFlights() public view returns (FlightStruct[] memory flightList) {
+        uint256 totalSpace;
+        for (uint i = 1; i <= _totalFlights.current(); i++) {
+            if (!flights[i].isDeleted && flights[i].isActive) totalSpace++;
+        }
+
+        flightList = new FlightStruct[](totalSpace);
+        uint256 j = 0;
+        for (uint i = 1; i <= _totalFlights.current(); i++) {
+            if (!flights[i].isDeleted && flights[i].isActive) {
+                flightList[j] = flights[i];
+                j++;
+            }
+        }
+    }
+
+    // Get Specific Flight Details
+    function getFlight(uint id) public view returns (FlightStruct memory) {
+        return flights[id];
+    }
+
+    // Book Flight Seats
+    function bookFlight(uint id, uint seatCount) public payable {
+        require(flightExist[id], "Flight not found");
+        require(flights[id].isActive, "Flight not active");
+        require(seatCount > 0, "Seat count must be greater than zero");
+        require(flights[id].availableSeats >= seatCount, "Not enough seats available");
+        uint totalPrice = (flights[id].pricePerSeat * seatCount) + securityFee;
+        require(msg.value >= totalPrice, "Insufficient funds");
+
+        BookingStruct memory booking;
+        booking.id = bookingsOf[id].length;
+        booking.passenger = msg.sender;
+        booking.seatCount = seatCount;
+        booking.totalPrice = totalPrice;
+        booking.bookingDate = block.timestamp;
+
+        bookingsOf[id].push(booking);
+        flights[id].availableSeats -= seatCount;
+        hasBooked[msg.sender][id] = true;
+    }
+
+    // Check-in to a Flight
+    function checkInFlight(uint id, uint bookingId) public {
+        require(msg.sender == bookingsOf[id][bookingId].passenger, "Unauthorized passenger");
+        require(!bookingsOf[id][bookingId].checkedIn, "Already checked-in");
+
+        bookingsOf[id][bookingId].checkedIn = true;
+        uint price = bookingsOf[id][bookingId].totalPrice;
+        uint fee = (price * taxPercent) / 100;
+
+        payTo(flights[id].airline, (price - fee));
+        payTo(owner(), fee);
+        payTo(msg.sender, securityFee);
+    }
+
+    // Refund Booking
+    function refundBooking(uint id, uint bookingId) public nonReentrant {
+        require(!bookingsOf[id][bookingId].checkedIn, "Already checked-in");
+
+        if (msg.sender != owner()) {
+            require(msg.sender == bookingsOf[id][bookingId].passenger, "Unauthorized passenger");
+        }
+
+        bookingsOf[id][bookingId].cancelled = true;
+        flights[id].availableSeats += bookingsOf[id][bookingId].seatCount;
+
+        uint refundAmount = bookingsOf[id][bookingId].totalPrice - securityFee;
+        payTo(msg.sender, refundAmount);
+    }
+
+    // Add Review
+    function addReview(uint flightId, string memory reviewText) public {
+        require(flightExist[flightId], "Flight not available");
+        require(hasBooked[msg.sender][flightId], "Book first before review");
+        require(bytes(reviewText).length > 0, "Review text cannot be empty");
+
+        ReviewStruct memory review;
+        review.id = reviewsOf[flightId].length;
+        review.flightId = flightId;
+        review.reviewText = reviewText;
+        review.timestamp = block.timestamp;
+        review.owner = msg.sender;
+
+        reviewsOf[flightId].push(review);
+    }
+
+    function payTo(address to, uint256 amount) internal {
+        (bool success, ) = payable(to).call{value: amount}("");
+        require(success);
+    }
+}
